@@ -1,0 +1,54 @@
+schemaVersion: '0.3'
+parameters:
+  AutomationAssumeRole:
+    type: String
+  MaintenanceWindow:
+    type: String
+mainSteps:
+  - name: RunScript
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: PowerShell 7.0
+      InputPayload:
+        MaintenanceWindow: '{{MaintenanceWindow}}'
+      Handler: script_handler
+      Script: |-
+        Write-Host "Installing and importing the AWS.Tools.SimpleSystemsManagement module..."
+        Install-Module AWS.Tools.SimpleSystemsManagement -Force
+        Import-Module AWS.Tools.SimpleSystemsManagement
+        # Get the MW ID(from the document's input parameters), and the MW current details
+        $input = $env:InputPayload | ConvertFrom-Json
+        $mw = Get-SSMMaintenanceWindow -WindowId $input.parameter
+        # Print the current details of the MW
+        Write-Host "Maintenance Window details:"
+        Write-Host "Name -"$mw.Name
+        Write-Host "Window ID -"$mw.WindowId
+        Write-Host "Maintenance Window's next execution time is:"$mw.NextExecutionTime
+        # Assign the Date/Day/Month/Year variables
+        Set-Date -Date (Get-Date).AddDays(-2)
+        $utcDate = (get-date).ToUniversalTime()
+        $month = $utcDate.Month
+        $year = $utcDate.Year
+        # Get all the Wednesdays of the current month
+        $wednesdays = 1..[DateTime]::DaysInMonth($year,$month) | ForEach-Object { Get-Date -Day $_ } | Where-Object { 3 -contains $_.DayOfWeek }
+        # Check if the current day of the week is a Wednesday AND if the current day of the week belongs to the Wednesdays of the current monthy
+        if(($wednesdays.Day.Contains($utcDate.Day)) -and ($wednesdays.DayOfWeek.Contains($utcDate.DayOfWeek)))
+        {
+        # Check if current day value is 1(if the month starts on a Wednesday, then the 2nd Wednesday comes before the Patch Tuesday)
+        if($utcDate.Day -eq 1)
+        {
+        Write-Host "Today is the first day of the month AND a Wednesday i.e, the 2nd Wednesday comes before the Patch Tuesday."
+        Write-Host "Updating the Maintenance Window to run on 3rd Wednesday of the month(i.e first Wednesday after the Patch Tuesday)..."
+        Update-SSMMaintenanceWindow -WindowId $mw.WindowId -Schedule "cron(0 0 0 ? * 4#3 *)"
+        Write-Host "Updated the Maintenance Window schedule. Next execution time is:"(Get-SSMMaintenanceWindow -WindowId $mw.WindowId).NextExecutionTime
+        }
+        # Code to execute on 4th Wednesday of the month # Check if current day value is 22(if the month starts on a Wednesday, then the 4th Wednesday day's value will be 22)
+        elseif($utcDate.Day -eq 22)
+        {
+        Write-Host "Today's date is 22, and it is the fourth Wednesday of the month."
+        Write-Host "Updating the Maintenance Window to run on 2nd Wednesday of the next month(as before)..."
+        Update-SSMMaintenanceWindow -WindowId $mw.WindowId -Schedule "cron(0 0 0 ? * 4#2 *)"
+        Write-Host "Updated the Maintenance Window schedule. Next execution time is:"(Get-SSMMaintenanceWindow -WindowId $mw.WindowId).NextExecutionTime
+        }
+        }

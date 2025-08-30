@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Run a PowerShell script or specify the paths to scripts to run.",
+  "mainSteps": [
+    {
+      "precondition": {
+        "StringEquals": [
+          "platformType",
+          "Windows"
+        ]
+      },
+      "action": "aws:runPowerShellScript",
+      "name": "DomainJoin",
+      "inputs": {
+        "timeoutSeconds": 60,
+        "runCommand": [
+          "Set-DefaultAWSRegion -Region us-east-1",
+          "$currentComputerName = hostname",
+          "#create credentials object",
+          "$user = \"Admin\"",
+          "$AdminPassword = \"cloud@123\"",
+          "$pass = $AdminPassword |ConvertTo-SecureString -AsPlainText -Force",
+          "$domain = \"aamir.com\"",
+          "$domainCreds = New-Object System.Management.Automation.PSCredential($user,$pass)",
+          "$DNS1 = \"10.0.0.1\"",
+          "$DNS2 = \"10.0.0.2\"",
+          "$Eth = Get-NetAdapter | where {$_.ifDesc -notlike \"TAP*\"} | foreach InterfaceAlias | select -Last 1",
+          "#Register DNS",
+          "If ($DNS2 -eq '')",
+          "{",
+          "Set-DnsClientServerAddress -InterfaceAlias $Eth -ResetServerAddresses",
+          "Set-DnsClientServerAddress -InterfaceAlias $Eth -ServerAddresses (\"$DNS1\")",
+          "} Else {",
+          "Set-DnsClientServerAddress -InterfaceAlias $Eth -ResetServerAddresses",
+          "Set-DnsClientServerAddress -InterfaceAlias $Eth -ServerAddresses (\"$DNS1\",\"$DNS2\")",
+          "}",
+          "#join instance to the domain",
+          "Add-Computer -ComputerName $currentComputerName -DomainCredential $domainCreds -Restart -DomainName \"$domain\" -Force"
+        ]
+      }
+    }
+  ]
+}

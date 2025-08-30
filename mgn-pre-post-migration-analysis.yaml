@@ -1,0 +1,589 @@
+schemaVersion: '0.3'
+description: Windows Migration Analysis
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  InstanceId:
+    type: String
+    description: EC2 Instance ID to analyze
+  ExecutionMode:
+    type: String
+    description: 'Execution mode: PRE or POST migration'
+    allowedValues:
+      - PRE
+      - POST
+    default: PRE
+  S3BucketName:
+    type: String
+    description: S3 bucket to store reports and comparison data
+  S3KeyPrefix:
+    type: String
+    description: S3 key prefix for organizing reports
+    default: migration-reports
+  AutomationAssumeRole:
+    type: String
+    description: IAM role for automation execution
+    default: ''
+  CompareWithPrevious:
+    type: String
+    description: Whether to compare with previous execution (POST mode only)
+    allowedValues:
+      - 'true'
+      - 'false'
+    default: 'false'
+mainSteps:
+  - name: CollectCriticalSystemData
+    action: aws:runCommand
+    timeoutSeconds: 480
+    nextStep: UploadReportToS3
+    isEnd: false
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '450'
+        commands:
+          - $ErrorActionPreference = 'SilentlyContinue'
+          - $ProgressPreference = 'SilentlyContinue'
+          - $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+          - $executionMode = '{{ ExecutionMode }}'
+          - $reportData = [ordered]@{}
+          - ''
+          - Write-Host 'Starting system data collection...'
+          - ''
+          - '# Add metadata first for better readability'
+          - $reportData['Metadata'] = [ordered]@{
+          - '    ''Timestamp'' = $timestamp'
+          - '    ''ExecutionMode'' = $executionMode'
+          - '    ''ComputerName'' = $env:COMPUTERNAME'
+          - '    ''ReportVersion'' = ''2.2-FixedS3'''
+          - '    ''GeneratedBy'' = ''SSM-MigrationAnalysis'''
+          - '}'
+          - ''
+          - '# Core System Information'
+          - Write-Host 'Collecting system information...'
+          - $systemInfo = [ordered]@{}
+          - $os = Get-CimInstance -ClassName Win32_OperatingSystem
+          - $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+          - $systemInfo['ComputerName'] = $env:COMPUTERNAME
+          - $systemInfo['Domain'] = $cs.Domain
+          - $systemInfo['OSVersion'] = $os.Version
+          - $systemInfo['OSCaption'] = $os.Caption
+          - $systemInfo['OSArchitecture'] = $os.OSArchitecture
+          - $systemInfo['TotalPhysicalMemoryGB'] = [math]::Round($cs.TotalPhysicalMemory/1GB, 2)
+          - $systemInfo['Manufacturer'] = $cs.Manufacturer
+          - $systemInfo['Model'] = $cs.Model
+          - $systemInfo['TimeZone'] = (Get-TimeZone).Id
+          - $systemInfo['LastBootUpTime'] = $os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm:ss')
+          - $systemInfo['UptimeHours'] = [math]::Round((New-TimeSpan -Start $os.LastBootUpTime).TotalHours, 2)
+          - $reportData['SystemInformation'] = $systemInfo
+          - ''
+          - '# Storage Information'
+          - Write-Host 'Collecting storage information...'
+          - $storageInfo = [ordered]@{}
+          - $disks = Get-CimInstance -ClassName Win32_LogicalDisk
+          - $diskArray = @()
+          - foreach ($disk in $disks) {
+          - '    if ($disk.Size -gt 0) {'
+          - '        $diskInfo = [ordered]@{'
+          - '            ''Drive'' = $disk.DeviceID'
+          - '            ''Label'' = $disk.VolumeName'
+          - '            ''FileSystem'' = $disk.FileSystem'
+          - '            ''SizeGB'' = [math]::Round($disk.Size/1GB, 2)'
+          - '            ''FreeSpaceGB'' = [math]::Round($disk.FreeSpace/1GB, 2)'
+          - '            ''UsedPercentage'' = [math]::Round((($disk.Size - $disk.FreeSpace)/$disk.Size)*100, 1)'
+          - '        }'
+          - '        $diskArray += $diskInfo'
+          - '    }'
+          - '}'
+          - $storageInfo['LogicalDisks'] = $diskArray
+          - $storageInfo['TotalDisks'] = $diskArray.Count
+          - $reportData['StorageInformation'] = $storageInfo
+          - ''
+          - '# Network Configuration'
+          - Write-Host 'Collecting network information...'
+          - $networkInfo = [ordered]@{}
+          - $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq $true}
+          - $networkArray = @()
+          - foreach ($adapter in $adapters) {
+          - '    $adapterInfo = [ordered]@{'
+          - '        ''Description'' = $adapter.Description'
+          - '        ''IPAddresses'' = $adapter.IPAddress -join '', '''
+          - '        ''SubnetMasks'' = $adapter.SubnetMask -join '', '''
+          - '        ''DefaultGateways'' = $adapter.DefaultIPGateway -join '', '''
+          - '        ''DNSServers'' = $adapter.DNSServerSearchOrder -join '', '''
+          - '    }'
+          - '    $networkArray += $adapterInfo'
+          - '}'
+          - $networkInfo['ActiveNetworkAdapters'] = $networkArray
+          - $networkInfo['NetworkShares'] = Get-CimInstance -ClassName Win32_Share | Where-Object {$_.Type -eq 0} | Select-Object Name, Path, Description
+          - $reportData['NetworkInformation'] = $networkInfo
+          - ''
+          - '# Services Information'
+          - Write-Host 'Collecting services information...'
+          - $servicesInfo = [ordered]@{}
+          - $allServices = Get-Service | Sort-Object Name
+          - $servicesInfo['TotalServices'] = $allServices.Count
+          - $servicesInfo['RunningServices'] = ($allServices | Where-Object {$_.Status -eq 'Running'}).Count
+          - $servicesInfo['StoppedServices'] = ($allServices | Where-Object {$_.Status -eq 'Stopped'}).Count
+          - ''
+          - $criticalServices = $allServices | Where-Object {$_.Status -eq 'Running' -and $_.StartType -eq 'Automatic'} | Select-Object -First 30
+          - $servicesInfo['CriticalRunningServices'] = $criticalServices | ForEach-Object {
+          - '    [ordered]@{'
+          - '        ''Name'' = $_.Name'
+          - '        ''DisplayName'' = $_.DisplayName'
+          - '        ''Status'' = $_.Status.ToString()'
+          - '        ''StartType'' = $_.StartType.ToString()'
+          - '    }'
+          - '}'
+          - ''
+          - $stoppedAutoServices = $allServices | Where-Object {$_.Status -eq 'Stopped' -and $_.StartType -eq 'Automatic'}
+          - $servicesInfo['StoppedAutomaticServices'] = $stoppedAutoServices | ForEach-Object {
+          - '    [ordered]@{'
+          - '        ''Name'' = $_.Name'
+          - '        ''DisplayName'' = $_.DisplayName'
+          - '        ''Status'' = $_.Status.ToString()'
+          - '        ''StartType'' = $_.StartType.ToString()'
+          - '    }'
+          - '}'
+          - $servicesInfo['StoppedAutomaticServicesCount'] = $stoppedAutoServices.Count
+          - $reportData['ServicesInformation'] = $servicesInfo
+          - ''
+          - '# Process Information (Top 15 by memory)'
+          - Write-Host 'Collecting process information...'
+          - $processInfo = [ordered]@{}
+          - $processes = Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 15
+          - $processInfo['TotalProcesses'] = (Get-Process | Measure-Object).Count
+          - $processInfo['TopProcessesByMemory'] = $processes | ForEach-Object {
+          - '    [ordered]@{'
+          - '        ''ProcessName'' = $_.ProcessName'
+          - '        ''Id'' = $_.Id'
+          - '        ''WorkingSetMB'' = [math]::Round($_.WorkingSet/1MB, 1)'
+          - '        ''CPUTime'' = if ($_.CPU) { [math]::Round($_.CPU, 2) } else { 0 }'
+          - '    }'
+          - '}'
+          - $reportData['ProcessInformation'] = $processInfo
+          - ''
+          - '# Security Information'
+          - Write-Host 'Collecting security information...'
+          - $securityInfo = [ordered]@{}
+          - $localUsers = Get-LocalUser
+          - $securityInfo['LocalUsers'] = $localUsers | ForEach-Object {
+          - '    [ordered]@{'
+          - '        ''Name'' = $_.Name'
+          - '        ''Enabled'' = $_.Enabled'
+          - '        ''LastLogon'' = if ($_.LastLogon) { $_.LastLogon.ToString(''yyyy-MM-dd HH:mm:ss'') } else { ''Never'' }'
+          - '        ''PasswordRequired'' = $_.PasswordRequired'
+          - '    }'
+          - '}'
+          - $securityInfo['EnabledUsersCount'] = ($localUsers | Where-Object {$_.Enabled}).Count
+          - $securityInfo['LocalGroups'] = Get-LocalGroup | Select-Object Name, Description
+          - $securityInfo['AdministratorsGroupMembers'] = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | Select-Object Name, ObjectClass
+          - $reportData['SecurityInformation'] = $securityInfo
+          - ''
+          - '# Registry and Software Information'
+          - Write-Host 'Collecting software information...'
+          - $softwareInfo = [ordered]@{}
+          - $systemRun = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
+          - $userRun = Get-ItemProperty 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
+          - $softwareInfo['SystemStartupPrograms'] = if ($systemRun) { ($systemRun | Get-Member -MemberType NoteProperty | Where-Object {$_.Name -ne 'PSPath' -and $_.Name -ne 'PSParentPath' -and $_.Name -ne 'PSChildName' -and $_.Name -ne 'PSDrive' -and $_.Name -ne 'PSProvider'}).Name } else { @() }
+          - $softwareInfo['UserStartupPrograms'] = if ($userRun) { ($userRun | Get-Member -MemberType NoteProperty | Where-Object {$_.Name -ne 'PSPath' -and $_.Name -ne 'PSParentPath' -and $_.Name -ne 'PSChildName' -and $_.Name -ne 'PSDrive' -and $_.Name -ne 'PSProvider'}).Name } else { @() }
+          - ''
+          - $installedPrograms = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object {$_.DisplayName}
+          - $softwareInfo['TotalInstalledPrograms'] = $installedPrograms.Count
+          - $softwareInfo['KeyEnterpriseApplications'] = $installedPrograms | Where-Object {$_.DisplayName -match '(SQL|IIS|Exchange|SharePoint|Oracle|VMware|Citrix|Office|Adobe|Java)'} | ForEach-Object {
+          - '    [ordered]@{'
+          - '        ''Name'' = $_.DisplayName'
+          - '        ''Version'' = $_.DisplayVersion'
+          - '        ''Publisher'' = $_.Publisher'
+          - '        ''InstallDate'' = $_.InstallDate'
+          - '    }'
+          - '} | Select-Object -First 20'
+          - $reportData['SoftwareInformation'] = $softwareInfo
+          - ''
+          - '# Windows Features'
+          - Write-Host 'Collecting Windows features...'
+          - $featuresInfo = [ordered]@{}
+          - $installedFeatures = Get-WindowsFeature | Where-Object {$_.InstallState -eq 'Installed'} | Select-Object -First 30
+          - $featuresInfo['InstalledFeaturesCount'] = (Get-WindowsFeature | Where-Object {$_.InstallState -eq 'Installed'}).Count
+          - $featuresInfo['KeyInstalledFeatures'] = $installedFeatures | ForEach-Object {
+          - '    [ordered]@{'
+          - '        ''Name'' = $_.Name'
+          - '        ''DisplayName'' = $_.DisplayName'
+          - '        ''InstallState'' = $_.InstallState.ToString()'
+          - '    }'
+          - '}'
+          - $reportData['WindowsFeaturesInformation'] = $featuresInfo
+          - ''
+          - '# Event Log Summary'
+          - Write-Host 'Collecting event log summary...'
+          - $eventLogInfo = [ordered]@{}
+          - $systemErrors = Get-EventLog -LogName System -EntryType Error -Newest 5 -ErrorAction SilentlyContinue
+          - $appErrors = Get-EventLog -LogName Application -EntryType Error -Newest 5 -ErrorAction SilentlyContinue
+          - ''
+          - $eventLogInfo['RecentSystemErrors'] = if ($systemErrors) {
+          - '    $systemErrors | ForEach-Object {'
+          - '        [ordered]@{'
+          - '            ''TimeGenerated'' = $_.TimeGenerated.ToString(''yyyy-MM-dd HH:mm:ss'')'
+          - '            ''Source'' = $_.Source'
+          - '            ''EventID'' = $_.EventID'
+          - '            ''EntryType'' = $_.EntryType.ToString()'
+          - '        }'
+          - '    }'
+          - '} else { @() }'
+          - ''
+          - $eventLogInfo['RecentApplicationErrors'] = if ($appErrors) {
+          - '    $appErrors | ForEach-Object {'
+          - '        [ordered]@{'
+          - '            ''TimeGenerated'' = $_.TimeGenerated.ToString(''yyyy-MM-dd HH:mm:ss'')'
+          - '            ''Source'' = $_.Source'
+          - '            ''EventID'' = $_.EventID'
+          - '            ''EntryType'' = $_.EntryType.ToString()'
+          - '        }'
+          - '    }'
+          - '} else { @() }'
+          - $reportData['EventLogInformation'] = $eventLogInfo
+          - ''
+          - '# Application Detection'
+          - Write-Host 'Detecting key applications...'
+          - $appInfo = [ordered]@{}
+          - $appInfo['IIS'] = [ordered]@{
+          - '    ''Installed'' = (Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue).InstallState -eq ''Installed'''
+          - '    ''Version'' = if ((Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue).InstallState -eq ''Installed'') { (Get-ItemProperty ''HKLM:\SOFTWARE\Microsoft\InetStp'' -ErrorAction SilentlyContinue).VersionString } else { ''N/A'' }'
+          - '}'
+          - $sqlServices = Get-Service | Where-Object {$_.Name -like '*SQL*'}
+          - $appInfo['SQLServer'] = [ordered]@{
+          - '    ''ServicesPresent'' = $sqlServices.Count -gt 0'
+          - '    ''ServiceCount'' = $sqlServices.Count'
+          - '    ''RunningServices'' = ($sqlServices | Where-Object {$_.Status -eq ''Running''}).Count'
+          - '}'
+          - $appInfo['HyperV'] = [ordered]@{
+          - '    ''Installed'' = (Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue).InstallState -eq ''Installed'''
+          - '}'
+          - $reportData['ApplicationInformation'] = $appInfo
+          - ''
+          - '# Performance Snapshot'
+          - Write-Host 'Taking performance snapshot...'
+          - $performanceInfo = [ordered]@{}
+          - $memoryCounter = Get-Counter '\Memory\Available MBytes' -ErrorAction SilentlyContinue
+          - $queueCounter = Get-Counter '\System\Processor Queue Length' -ErrorAction SilentlyContinue
+          - $performanceInfo['AvailableMemoryMB'] = if ($memoryCounter) { [math]::Round($memoryCounter.CounterSamples[0].CookedValue, 1) } else { 'N/A' }
+          - $performanceInfo['ProcessorQueueLength'] = if ($queueCounter) { [math]::Round($queueCounter.CounterSamples[0].CookedValue, 2) } else { 'N/A' }
+          - $performanceInfo['MemoryUtilizationPercent'] = if ($memoryCounter) { [math]::Round(((($reportData.SystemInformation.TotalPhysicalMemoryGB * 1024) - $memoryCounter.CounterSamples[0].CookedValue) / ($reportData.SystemInformation.TotalPhysicalMemoryGB * 1024)) * 100, 1) } else { 'N/A' }
+          - $reportData['PerformanceInformation'] = $performanceInfo
+          - ''
+          - '# Update metadata with completion time'
+          - $endTime = Get-Date
+          - $startTime = [datetime]::ParseExact($timestamp, 'yyyy-MM-dd_HH-mm-ss', $null)
+          - $reportData.Metadata['CollectionDurationSeconds'] = [math]::Round(($endTime - $startTime).TotalSeconds, 2)
+          - $reportData.Metadata['CompletionTime'] = $endTime.ToString('yyyy-MM-dd HH:mm:ss')
+          - ''
+          - Write-Host 'Converting to readable JSON format...'
+          - $jsonReport = $reportData | ConvertTo-Json -Depth 10
+          - ''
+          - '# Save to local file'
+          - $reportFileName = "migration-report-$executionMode-$timestamp.json"
+          - $localReportPath = "C:\temp\$reportFileName"
+          - New-Item -Path 'C:\temp' -ItemType Directory -Force | Out-Null
+          - $jsonReport | Out-File -FilePath $localReportPath -Encoding UTF8
+          - ''
+          - Write-Host "Report completed in $($reportData.Metadata.CollectionDurationSeconds) seconds"
+          - 'Write-Host "Report saved: $localReportPath"'
+          - 'Write-Host "Report size: $((Get-Item $localReportPath).Length) bytes"'
+          - ''
+          - Write-Output $localReportPath
+    outputs:
+      - Name: ReportPath
+        Selector: $.Output
+        Type: String
+  - name: UploadReportToS3
+    action: aws:runCommand
+    timeoutSeconds: 120
+    nextStep: GenerateComparisonReport
+    isEnd: false
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '90'
+        commands:
+          - $bucketName = '{{ S3BucketName }}'
+          - $keyPrefix = '{{ S3KeyPrefix }}'
+          - $instanceId = '{{ InstanceId }}'
+          - $executionMode = '{{ ExecutionMode }}'
+          - $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+          - ''
+          - $previousOutput = '{{ CollectCriticalSystemData.ReportPath }}'
+          - $reportPath = ($previousOutput -split "`n" | Where-Object {$_ -like 'C:\temp\migration-report-*'} | Select-Object -First 1).Trim()
+          - ''
+          - if (-not $reportPath -or -not (Test-Path $reportPath)) {
+          - '    $possibleTimestamp = if ($previousOutput -match ''(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})'') { $matches[1] } else { $timestamp }'
+          - '    $reportPath = "C:\temp\migration-report-$executionMode-$possibleTimestamp.json"'
+          - '}'
+          - ''
+          - 'Write-Host "Looking for report at: $reportPath"'
+          - ''
+          - if (Test-Path $reportPath) {
+          - '    $reportFileName = Split-Path $reportPath -Leaf'
+          - '    $s3Key = "$keyPrefix/$instanceId/$reportFileName"'
+          - '    '
+          - '    Write-Host "Uploading: $reportFileName to s3://$bucketName/$s3Key"'
+          - '    aws s3 cp "$reportPath" "s3://$bucketName/$s3Key" --no-progress'
+          - '    '
+          - '    if ($LASTEXITCODE -eq 0) {'
+          - '        Write-Host "Successfully uploaded: s3://$bucketName/$s3Key"'
+          - '        $reportContent = Get-Content $reportPath | ConvertFrom-Json'
+          - '        Write-Host "- Report version: $($reportContent.Metadata.ReportVersion)"'
+          - '        Write-Host "- System: $($reportContent.SystemInformation.ComputerName)"'
+          - '        Write-Host "- Collection time: $($reportContent.Metadata.CollectionDurationSeconds) seconds"'
+          - '        Write-Output "S3_LOCATION:s3://$bucketName/$s3Key"'
+          - '    } else {'
+          - '        Write-Error "Failed to upload to S3 (Exit code: $LASTEXITCODE)"'
+          - '    }'
+          - '} else {'
+          - '    Write-Host "Files in C:\temp:"'
+          - '    Get-ChildItem ''C:\temp\migration-report-*.json'' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }'
+          - '    $anyReport = Get-ChildItem ''C:\temp\migration-report-*.json'' -ErrorAction SilentlyContinue | Select-Object -First 1'
+          - '    if ($anyReport) {'
+          - '        Write-Host "Using alternative report: $($anyReport.FullName)"'
+          - '        $reportFileName = $anyReport.Name'
+          - '        $s3Key = "$keyPrefix/$instanceId/$reportFileName"'
+          - '        aws s3 cp "$($anyReport.FullName)" "s3://$bucketName/$s3Key" --no-progress'
+          - '        if ($LASTEXITCODE -eq 0) {'
+          - '            Write-Output "S3_LOCATION:s3://$bucketName/$s3Key"'
+          - '        }'
+          - '    } else {'
+          - '        Write-Error "No migration report files found"'
+          - '    }'
+          - '}'
+  - name: GenerateComparisonReport
+    action: aws:runCommand
+    timeoutSeconds: 180
+    nextStep: DisplaySummary
+    isEnd: false
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '150'
+        commands:
+          - $compareWithPrevious = '{{ CompareWithPrevious }}'
+          - $executionMode = '{{ ExecutionMode }}'
+          - $bucketName = '{{ S3BucketName }}'
+          - $keyPrefix = '{{ S3KeyPrefix }}'
+          - $instanceId = '{{ InstanceId }}'
+          - $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+          - ''
+          - if ($compareWithPrevious -eq 'true' -and $executionMode -eq 'POST') {
+          - '    Write-Host ''Generating comparison report with improved file handling...'''
+          - '    '
+          - '    # Use more robust S3 listing with proper parsing'
+          - '    Write-Host ''Listing S3 files for comparison...'''
+          - '    $s3Path = "s3://$bucketName/$keyPrefix/$instanceId/"'
+          - '    Write-Host "S3 Path: $s3Path"'
+          - '    '
+          - '    # Get file list using aws s3api for better parsing'
+          - '    $s3Objects = aws s3api list-objects-v2 --bucket $bucketName --prefix "$keyPrefix/$instanceId/" --query ''Contents[].Key'' --output text --no-cli-pager'
+          - '    '
+          - '    if ($s3Objects) {'
+          - '        $allFiles = $s3Objects -split "`t" | ForEach-Object { $_.Trim() }'
+          - '        $preFiles = $allFiles | Where-Object { $_ -like ''*PRE*'' }'
+          - '        $postFiles = $allFiles | Where-Object { $_ -like ''*POST*'' }'
+          - '        '
+          - '        Write-Host "Found PRE files: $($preFiles.Count)"'
+          - '        Write-Host "Found POST files: $($postFiles.Count)"'
+          - '        '
+          - '        if ($preFiles -and $postFiles) {'
+          - '            # Get the most recent files'
+          - '            $latestPreFile = ($preFiles | Sort-Object)[-1]'
+          - '            $latestPostFile = ($postFiles | Sort-Object)[-1]'
+          - '            '
+          - '            Write-Host "Latest PRE file: $latestPreFile"'
+          - '            Write-Host "Latest POST file: $latestPostFile"'
+          - '            '
+          - '            # Extract just the filename for local storage'
+          - '            $preFileName = Split-Path $latestPreFile -Leaf'
+          - '            $postFileName = Split-Path $latestPostFile -Leaf'
+          - '            '
+          - '            # Download files using full S3 keys'
+          - '            Write-Host ''Downloading reports for comparison...'''
+          - '            aws s3 cp "s3://$bucketName/$latestPreFile" "C:\temp\$preFileName" --no-cli-pager'
+          - '            aws s3 cp "s3://$bucketName/$latestPostFile" "C:\temp\$postFileName" --no-cli-pager'
+          - '            '
+          - '            # Verify downloads'
+          - '            $preExists = Test-Path "C:\temp\$preFileName"'
+          - '            $postExists = Test-Path "C:\temp\$postFileName"'
+          - '            '
+          - '            Write-Host "PRE report downloaded: $preExists"'
+          - '            Write-Host "POST report downloaded: $postExists"'
+          - '            '
+          - '            if ($preExists -and $postExists) {'
+          - '                # Load and compare reports'
+          - '                $preReport = Get-Content "C:\temp\$preFileName" | ConvertFrom-Json'
+          - '                $postReport = Get-Content "C:\temp\$postFileName" | ConvertFrom-Json'
+          - '                '
+          - '                Write-Host ''Generating comparison...'''
+          - '                '
+          - '                # Create comparison object'
+          - '                $comparison = [ordered]@{'
+          - '                    ''ComparisonMetadata'' = [ordered]@{'
+          - '                        ''ComparisonTimestamp'' = $timestamp'
+          - '                        ''PreReportFile'' = $preFileName'
+          - '                        ''PostReportFile'' = $postFileName'
+          - '                        ''PreReportTimestamp'' = $preReport.Metadata.Timestamp'
+          - '                        ''PostReportTimestamp'' = $postReport.Metadata.Timestamp'
+          - '                        ''InstanceId'' = $instanceId'
+          - '                        ''ComparisonVersion'' = ''2.2-FixedS3'''
+          - '                    }'
+          - '                }'
+          - '                '
+          - '                # System comparison'
+          - '                $comparison[''SystemComparison''] = [ordered]@{'
+          - '                    ''OSVersionChanged'' = ($preReport.SystemInformation.OSVersion -ne $postReport.SystemInformation.OSVersion)'
+          - '                    ''PreOSVersion'' = $preReport.SystemInformation.OSVersion'
+          - '                    ''PostOSVersion'' = $postReport.SystemInformation.OSVersion'
+          - '                    ''UptimeChanged'' = $true'
+          - '                    ''PreUptimeHours'' = $preReport.SystemInformation.UptimeHours'
+          - '                    ''PostUptimeHours'' = $postReport.SystemInformation.UptimeHours'
+          - '                }'
+          - '                '
+          - '                # Services comparison'
+          - '                $comparison[''ServicesComparison''] = [ordered]@{'
+          - '                    ''TotalServicesChanged'' = ($preReport.ServicesInformation.TotalServices -ne $postReport.ServicesInformation.TotalServices)'
+          - '                    ''PreTotalServices'' = $preReport.ServicesInformation.TotalServices'
+          - '                    ''PostTotalServices'' = $postReport.ServicesInformation.TotalServices'
+          - '                    ''ServiceCountDifference'' = $postReport.ServicesInformation.TotalServices - $preReport.ServicesInformation.TotalServices'
+          - '                    ''RunningServicesChanged'' = ($preReport.ServicesInformation.RunningServices -ne $postReport.ServicesInformation.RunningServices)'
+          - '                    ''PreRunningServices'' = $preReport.ServicesInformation.RunningServices'
+          - '                    ''PostRunningServices'' = $postReport.ServicesInformation.RunningServices'
+          - '                    ''StoppedAutoServicesChanged'' = ($preReport.ServicesInformation.StoppedAutomaticServicesCount -ne $postReport.ServicesInformation.StoppedAutomaticServicesCount)'
+          - '                    ''PreStoppedAutoServices'' = $preReport.ServicesInformation.StoppedAutomaticServicesCount'
+          - '                    ''PostStoppedAutoServices'' = $postReport.ServicesInformation.StoppedAutomaticServicesCount'
+          - '                }'
+          - '                '
+          - '                # Software comparison'
+          - '                $comparison[''SoftwareComparison''] = [ordered]@{'
+          - '                    ''InstalledProgramsChanged'' = ($preReport.SoftwareInformation.TotalInstalledPrograms -ne $postReport.SoftwareInformation.TotalInstalledPrograms)'
+          - '                    ''PreInstalledPrograms'' = $preReport.SoftwareInformation.TotalInstalledPrograms'
+          - '                    ''PostInstalledPrograms'' = $postReport.SoftwareInformation.TotalInstalledPrograms'
+          - '                    ''ProgramCountDifference'' = $postReport.SoftwareInformation.TotalInstalledPrograms - $preReport.SoftwareInformation.TotalInstalledPrograms'
+          - '                }'
+          - '                '
+          - '                # Performance comparison'
+          - '                $comparison[''PerformanceComparison''] = [ordered]@{'
+          - '                    ''PreAvailableMemoryMB'' = $preReport.PerformanceInformation.AvailableMemoryMB'
+          - '                    ''PostAvailableMemoryMB'' = $postReport.PerformanceInformation.AvailableMemoryMB'
+          - '                    ''PreMemoryUtilization'' = $preReport.PerformanceInformation.MemoryUtilizationPercent'
+          - '                    ''PostMemoryUtilization'' = $postReport.PerformanceInformation.MemoryUtilizationPercent'
+          - '                }'
+          - '                '
+          - '                # Summary with change detection'
+          - '                $keyChanges = @()'
+          - '                $recommendations = @()'
+          - '                '
+          - '                if ($comparison.SystemComparison.OSVersionChanged) { $keyChanges += ''OS Version changed'' }'
+          - '                if ($comparison.ServicesComparison.TotalServicesChanged) { $keyChanges += ''Service count changed'' }'
+          - '                if ($comparison.SoftwareComparison.InstalledProgramsChanged) { $keyChanges += ''Installed programs changed'' }'
+          - '                '
+          - '                if ($comparison.ServicesComparison.StoppedAutoServicesChanged -and $postReport.ServicesInformation.StoppedAutomaticServicesCount -gt $preReport.ServicesInformation.StoppedAutomaticServicesCount) {'
+          - '                    $recommendations += ''Review stopped automatic services'''
+          - '                }'
+          - '                if ($comparison.SoftwareComparison.ProgramCountDifference -ne 0) {'
+          - '                    $recommendations += ''Verify all required applications are installed'''
+          - '                }'
+          - '                '
+          - '                $comparison[''Summary''] = [ordered]@{'
+          - '                    ''MigrationStatus'' = ''Completed'''
+          - '                    ''KeyChangesDetected'' = $keyChanges'
+          - '                    ''RecommendedActions'' = $recommendations'
+          - '                    ''TotalChangesCount'' = $keyChanges.Count'
+          - '                }'
+          - '                '
+          - '                # Save comparison report'
+          - '                $comparisonJson = $comparison | ConvertTo-Json -Depth 8'
+          - '                $comparisonFileName = "migration-comparison-$timestamp.json"'
+          - '                $comparisonPath = "C:\temp\$comparisonFileName"'
+          - '                $comparisonJson | Out-File -FilePath $comparisonPath -Encoding UTF8'
+          - '                '
+          - '                # Upload comparison report'
+          - '                $comparisonS3Key = "$keyPrefix/$instanceId/$comparisonFileName"'
+          - '                aws s3 cp "$comparisonPath" "s3://$bucketName/$comparisonS3Key" --no-cli-pager'
+          - '                '
+          - '                if ($LASTEXITCODE -eq 0) {'
+          - '                    Write-Host "Comparison report uploaded: s3://$bucketName/$comparisonS3Key"'
+          - '                    Write-Host "Changes detected: $($keyChanges.Count)"'
+          - '                    Write-Host "Recommendations: $($recommendations.Count)"'
+          - '                    Write-Output "COMPARISON_COMPLETED:success"'
+          - '                } else {'
+          - '                    Write-Error "Failed to upload comparison report (Exit code: $LASTEXITCODE)"'
+          - '                    Write-Output "COMPARISON_COMPLETED:upload_failed"'
+          - '                }'
+          - '            } else {'
+          - '                Write-Error "Failed to download both reports for comparison"'
+          - '                Write-Host "PRE file exists: $preExists"'
+          - '                Write-Host "POST file exists: $postExists"'
+          - '                Write-Output "COMPARISON_COMPLETED:download_failed"'
+          - '            }'
+          - '        } else {'
+          - '            Write-Host "Could not find both PRE and POST reports"'
+          - '            Write-Host "PRE files found: $($preFiles.Count)"'
+          - '            Write-Host "POST files found: $($postFiles.Count)"'
+          - '            Write-Output "COMPARISON_COMPLETED:reports_missing"'
+          - '        }'
+          - '    } else {'
+          - '        Write-Host "No files found in S3 path: $s3Path"'
+          - '        Write-Output "COMPARISON_COMPLETED:no_files"'
+          - '    }'
+          - '} else {'
+          - '    Write-Host ''Comparison not requested or not in POST mode'''
+          - '    Write-Output "COMPARISON_COMPLETED:not_requested"'
+          - '}'
+  - name: DisplaySummary
+    action: aws:runCommand
+    timeoutSeconds: 60
+    isEnd: true
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '30'
+        commands:
+          - $executionMode = '{{ ExecutionMode }}'
+          - $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+          - ''
+          - Write-Host '=== MIGRATION REPORT SUMMARY ==='
+          - 'Write-Host "Mode: $executionMode | Time: $timestamp | Instance: {{ InstanceId }}"'
+          - ''
+          - $latestReport = Get-ChildItem 'C:\temp\migration-report-*.json' | Sort-Object CreationTime -Descending | Select-Object -First 1
+          - if ($latestReport) {
+          - '    Write-Host "Report file: $($latestReport.Name)"'
+          - '    $reportData = Get-Content $latestReport.FullName | ConvertFrom-Json'
+          - '    '
+          - '    Write-Host "Computer: $($reportData.SystemInformation.ComputerName)"'
+          - '    Write-Host "OS: $($reportData.SystemInformation.OSCaption) ($($reportData.SystemInformation.OSVersion))"'
+          - '    Write-Host "Memory: $($reportData.SystemInformation.TotalPhysicalMemoryGB)GB total, $($reportData.PerformanceInformation.AvailableMemoryMB)MB available"'
+          - '    Write-Host "Services: $($reportData.ServicesInformation.RunningServices)/$($reportData.ServicesInformation.TotalServices) running"'
+          - '    if ($reportData.ServicesInformation.StoppedAutomaticServicesCount -gt 0) {'
+          - '        Write-Host "Warning: $($reportData.ServicesInformation.StoppedAutomaticServicesCount) automatic services are stopped"'
+          - '    }'
+          - '    Write-Host "Software: $($reportData.SoftwareInformation.TotalInstalledPrograms) programs installed"'
+          - '    Write-Host "Key Apps: IIS=$($reportData.ApplicationInformation.IIS.Installed), SQL=$($reportData.ApplicationInformation.SQLServer.ServicesPresent), HyperV=$($reportData.ApplicationInformation.HyperV.Installed)"'
+          - '    '
+          - '    Write-Host ''Storage:'''
+          - '    foreach ($disk in $reportData.StorageInformation.LogicalDisks) {'
+          - '        $status = if ($disk.UsedPercentage -gt 90) { ''🔴'' } elseif ($disk.UsedPercentage -gt 80) { ''🟡'' } else { ''🟢'' }'
+          - '        Write-Host "   $status $($disk.Drive) $($disk.UsedPercentage)% used ($($disk.FreeSpaceGB)GB free)"'
+          - '    }'
+          - '    '
+          - '    Write-Host "Collection completed in $($reportData.Metadata.CollectionDurationSeconds) seconds"'
+          - '    Write-Host "Report generated successfully!"'
+          - '}'
+          - ''
+          - Write-Host '=== EXECUTION COMPLETED ==='
+          - Write-Output "STATUS:COMPLETED"
+          - Write-Output "MODE:$executionMode"
+outputs:
+  - DisplaySummary.Output

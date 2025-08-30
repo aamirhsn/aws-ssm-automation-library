@@ -1,0 +1,191 @@
+schemaVersion: '0.3'
+description: Check and remove public IP addresses from EC2 instances
+assumeRole: '{{AutomationAssumeRole}}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.
+    default: ''
+    allowedPattern: ^arn:aws(-cn|-us-gov)?:iam::\d{12}:role\/[\w+=,.@_\/-]+|^$
+  DryRun:
+    type: Boolean
+    description: If true, only check for public IPs without removing them
+    default: false
+mainSteps:
+  - name: removePublicIPs
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: lambda_handler
+      Script: |
+        import boto3
+        import logging
+        import json
+        from botocore.exceptions import ClientError
+
+        # Set up logging
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        def is_instance_running(ec2_client, instance_id):
+            """Check if instance is running and return detailed status"""
+            try:
+                response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                instance = response['Reservations'][0]['Instances'][0]
+                state = instance['State']['Name']
+                return {
+                    'is_running': state == 'running',
+                    'state': state,
+                    'state_reason': instance['State'].get('StateReason', {}).get('Message', 'No reason provided')
+                }
+            except Exception as e:
+                logger.error(f"Error checking instance {instance_id} state: {str(e)}")
+                return {'is_running': False, 'state': 'unknown', 'state_reason': str(e)}
+
+        def remove_public_ip(ec2_client, instance_id, network_interface_id, dry_run=False):
+            """Remove public IP by disassociating it from the network interface"""
+            try:
+                if dry_run:
+                    logger.info(f"DryRun: Would remove public IP from network interface {network_interface_id}")
+                    return {'success': True, 'message': 'Dry run successful'}
+
+                # Get the network interface details
+                response = ec2_client.describe_network_interfaces(
+                    NetworkInterfaceIds=[network_interface_id]
+                )
+                
+                # Check if there's a public IP association
+                if 'Association' not in response['NetworkInterfaces'][0]:
+                    return {'success': True, 'message': 'No public IP association found'}
+
+                association_id = response['NetworkInterfaces'][0]['Association']['AssociationId']
+                
+                # Disassociate the public IP
+                logger.info(f"Disassociating public IP from network interface {network_interface_id}")
+                ec2_client.disassociate_address(
+                    AssociationId=association_id
+                )
+
+                # Modify the network interface to prevent auto-assignment of public IP
+                logger.info(f"Modifying network interface attributes for {network_interface_id}")
+                ec2_client.modify_network_interface_attribute(
+                    NetworkInterfaceId=network_interface_id,
+                    SourceDestCheck={
+                        'Value': True
+                    }
+                )
+
+                return {'success': True, 'message': 'Successfully removed public IP'}
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error removing public IP: {error_msg}")
+                return {'success': False, 'message': f"Error: {error_msg}"}
+
+        def lambda_handler(event, context):
+            try:
+                ec2_client = boto3.client('ec2')
+                dry_run = event.get('Input', {}).get('DryRun', False)
+                
+                results = {
+                    'success_count': 0,
+                    'skip_count': 0,
+                    'fail_count': 0,
+                    'processed_instances': [],
+                    'total_instances': 0
+                }
+                
+                paginator = ec2_client.get_paginator('describe_instances')
+                for page in paginator.paginate():
+                    for reservation in page['Reservations']:
+                        for instance in reservation['Instances']:
+                            instance_id = instance['InstanceId']
+                            
+                            instance_result = {
+                                'instance_id': instance_id,
+                                'status': '',
+                                'message': '',
+                                'public_ip': '',
+                                'vpc_id': instance.get('VpcId', 'N/A'),
+                                'subnet_id': instance.get('SubnetId', 'N/A'),
+                                'state': instance['State']['Name']
+                            }
+                            
+                            results['total_instances'] += 1
+                            
+                            try:
+                                if 'PublicIpAddress' in instance:
+                                    public_ip = instance['PublicIpAddress']
+                                    instance_result['public_ip'] = public_ip
+                                    
+                                    # Check instance state
+                                    instance_state = is_instance_running(ec2_client, instance_id)
+                                    if not instance_state['is_running']:
+                                        results['skip_count'] += 1
+                                        instance_result['status'] = 'SKIPPED'
+                                        instance_result['message'] = f"Instance not running. Current state: {instance_state['state']}"
+                                        results['processed_instances'].append(instance_result)
+                                        continue
+                                    
+                                    # Get the primary network interface ID
+                                    network_interface_id = instance['NetworkInterfaces'][0]['NetworkInterfaceId']
+                                    
+                                    logger.info(f"Processing instance {instance_id} with public IP {public_ip}")
+                                    
+                                    result = remove_public_ip(ec2_client, instance_id, network_interface_id, dry_run)
+                                    if result['success']:
+                                        results['success_count'] += 1
+                                        instance_result['status'] = 'SUCCESS'
+                                        instance_result['message'] = result['message']
+                                    else:
+                                        results['fail_count'] += 1
+                                        instance_result['status'] = 'FAILED'
+                                        instance_result['message'] = result['message']
+                                else:
+                                    results['skip_count'] += 1
+                                    instance_result['status'] = 'SKIPPED'
+                                    instance_result['message'] = 'No public IP found'
+                            
+                            except Exception as inst_error:
+                                results['fail_count'] += 1
+                                instance_result['status'] = 'FAILED'
+                                instance_result['message'] = f"Error: {str(inst_error)}"
+                                logger.error(f"Error processing instance {instance_id}: {str(inst_error)}")
+                            
+                            results['processed_instances'].append(instance_result)
+                
+                return {
+                    'statusCode': 200,
+                    'summary': {
+                        'total_instances': results['total_instances'],
+                        'success_count': results['success_count'],
+                        'skip_count': results['skip_count'],
+                        'fail_count': results['fail_count'],
+                        'dry_run': dry_run
+                    },
+                    'details': json.dumps(results['processed_instances'], indent=2)
+                }
+            
+            except Exception as e:
+                logger.error(f"Error in lambda execution: {str(e)}")
+                raise e
+    outputs:
+      - Name: TotalInstances
+        Selector: $.Payload.summary.total_instances
+        Type: Integer
+      - Name: SuccessCount
+        Selector: $.Payload.summary.success_count
+        Type: Integer
+      - Name: SkipCount
+        Selector: $.Payload.summary.skip_count
+        Type: Integer
+      - Name: FailCount
+        Selector: $.Payload.summary.fail_count
+        Type: Integer
+      - Name: DryRun
+        Selector: $.Payload.summary.dry_run
+        Type: Boolean
+      - Name: Details
+        Selector: $.Payload.details
+        Type: String

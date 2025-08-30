@@ -1,0 +1,126 @@
+description: SSM Automation to tag AWS resources including EC2, SSM-managed nodes, EBS, Snapshot, AMI, ENI, VPC, S3, SSM Documents, Parameter Store, ASG, and Classic Load Balancer.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Optional) IAM role ARN that allows Automation to perform actions.
+    default: ''
+  ResourceType:
+    type: String
+    description: Type of AWS resource to tag
+    allowedValues:
+      - ec2
+      - ebs
+      - snapshot
+      - ami
+      - eni
+      - vpc
+      - s3
+      - asg
+      - elb
+      - Parameter
+      - Document
+      - ManagedInstance
+  ResourceId:
+    type: String
+    description: Resource identifier (e.g., i-0123456789abcdef0, my-bucket-name, vpc-xxxxxx)
+  TagKey:
+    type: String
+    description: Tag key to apply
+  TagValue:
+    type: String
+    description: Tag value to apply
+mainSteps:
+  - name: DetermineTaggingStep
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: TagEC2BasedResources
+          Or:
+            - Variable: '{{ ResourceType }}'
+              StringEquals: ec2
+            - Variable: '{{ ResourceType }}'
+              StringEquals: ebs
+            - Variable: '{{ ResourceType }}'
+              StringEquals: snapshot
+            - Variable: '{{ ResourceType }}'
+              StringEquals: ami
+            - Variable: '{{ ResourceType }}'
+              StringEquals: eni
+            - Variable: '{{ ResourceType }}'
+              StringEquals: vpc
+        - NextStep: TagSSMResource
+          Or:
+            - Variable: '{{ ResourceType }}'
+              StringEquals: ManagedInstance
+            - Variable: '{{ ResourceType }}'
+              StringEquals: Document
+            - Variable: '{{ ResourceType }}'
+              StringEquals: Parameter
+        - NextStep: TagS3Bucket
+          Variable: '{{ ResourceType }}'
+          StringEquals: s3
+        - NextStep: TagASG
+          Variable: '{{ ResourceType }}'
+          StringEquals: asg
+        - NextStep: TagELB
+          Variable: '{{ ResourceType }}'
+          StringEquals: elb
+      Default: TagEC2BasedResources
+  - name: TagEC2BasedResources
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: ec2
+      Api: CreateTags
+      Resources:
+        - '{{ ResourceId }}'
+      Tags:
+        - Key: '{{ TagKey }}'
+          Value: '{{ TagValue }}'
+  - name: TagS3Bucket
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: s3
+      Api: PutBucketTagging
+      Bucket: '{{ ResourceId }}'
+      Tagging:
+        TagSet:
+          - Key: '{{ TagKey }}'
+            Value: '{{ TagValue }}'
+  - name: TagSSMResource
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: ssm
+      Api: AddTagsToResource
+      ResourceType: '{{ ResourceType }}'
+      ResourceId: '{{ ResourceId }}'
+      Tags:
+        - Key: '{{ TagKey }}'
+          Value: '{{ TagValue }}'
+  - name: TagASG
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: autoscaling
+      Api: CreateOrUpdateTags
+      Tags:
+        - ResourceId: '{{ ResourceId }}'
+          ResourceType: auto-scaling-group
+          Key: '{{ TagKey }}'
+          Value: '{{ TagValue }}'
+          PropagateAtLaunch: true
+  - name: TagELB
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: elb
+      Api: AddTags
+      LoadBalancerNames:
+        - '{{ ResourceId }}'
+      Tags:
+        - Key: '{{ TagKey }}'
+          Value: '{{ TagValue }}'

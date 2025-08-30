@@ -1,0 +1,177 @@
+description: SSM Automation to export from and import parameters to AWS Parameter Store across selected regions, including tier, description, tags, and policy information.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  Operation:
+    type: String
+    description: The operation to perform (export or import).
+    allowedValues:
+      - Export
+      - Import
+  S3BucketName:
+    type: String
+    description: The name of the S3 bucket to export parameters to or import parameters from in your current region.
+  ParameterType:
+    type: String
+    description: The type of parameters to handle (String, StringList, SecureString, or All).
+    allowedValues:
+      - String
+      - StringList
+      - SecureString
+      - All
+  S3FilePath:
+    type: String
+    description: Path to the file in the S3 bucket for import/export operations.
+    default: ParametersBackupFolder/parameters.json
+  Regions:
+    type: StringList
+    description: Comma-separated list of AWS regions to operate in. E.g., us-east-1,eu-central-1
+    default: []
+  AutomationAssumeRole:
+    type: String
+    description: (Required) The IAM role to assume during execution.
+mainSteps:
+  - name: ExportImportParameters
+    action: aws:executeScript
+    timeoutSeconds: 3600
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handle_parameters
+      Script: |
+        import boto3
+        import json
+
+        def handle_parameters(event, context):
+            s3_client = boto3.client('s3')
+            s3_bucket = event['S3BucketName']
+            parameter_type = event['ParameterType']
+            S3FilePath = event['S3FilePath']
+            regions = event['Regions']
+            operation = event['Operation']
+
+            if not regions:
+                regions = [boto3.session.Session().region_name]
+
+            parameter_types = ['String', 'StringList', 'SecureString'] if parameter_type == 'All' else [parameter_type]
+
+            if operation == 'Export':
+                all_parameter_details = []
+
+                for region in regions:
+                    ssm_client = boto3.client('ssm', region_name=region)
+                    parameters = []
+                    next_token = None
+
+                    while True:
+                        if next_token:
+                            response = ssm_client.describe_parameters(
+                                ParameterFilters=[{'Key': 'Type', 'Values': parameter_types}],
+                                NextToken=next_token
+                            )
+                        else:
+                            response = ssm_client.describe_parameters(
+                                ParameterFilters=[{'Key': 'Type', 'Values': parameter_types}]
+                            )
+
+                        parameters.extend(response['Parameters'])
+                        next_token = response.get('NextToken')
+                        if not next_token:
+                            break
+
+                    param_names = [param['Name'] for param in parameters]
+
+                    for i in range(0, len(param_names), 10):
+                        batch = param_names[i:i+10]
+
+                        param_values = ssm_client.get_parameters(
+                            Names=batch,
+                            WithDecryption=True
+                        )
+
+                        param_metadata = ssm_client.describe_parameters(
+                            ParameterFilters=[{'Key': 'Name', 'Values': batch}]
+                        )
+
+                        for param in param_values['Parameters']:
+                            meta = next((m for m in param_metadata['Parameters'] if m['Name'] == param['Name']), {})
+                            tier = meta.get('Tier', 'Standard')
+                            description = meta.get('Description', '')
+                            policies = meta.get('Policies', [])
+                            key_id = meta.get('KeyId', '') if param['Type'] == 'SecureString' else ''
+
+                            try:
+                                tag_response = ssm_client.list_tags_for_resource(
+                                    ResourceType='Parameter',
+                                    ResourceId=param['Name']
+                                )
+                                tags = tag_response.get('TagList', [])
+                            except Exception:
+                                tags = []
+
+                            all_parameter_details.append({
+                                'Region': region,
+                                'Name': param['Name'],
+                                'Value': param['Value'],
+                                'Type': param['Type'],
+                                'Tier': tier,
+                                'Description': description,
+                                'Policies': policies,
+                                'Tags': tags,
+                                'KeyId': key_id
+                            })
+
+                json_data = json.dumps(all_parameter_details, indent=4)
+                s3_client.put_object(Bucket=s3_bucket, Key=S3FilePath, Body=json_data)
+                return {"status": "Export successful"}
+
+            elif operation == 'Import':
+                s3_object = s3_client.get_object(Bucket=s3_bucket, Key=S3FilePath)
+                json_data = s3_object['Body'].read().decode('utf-8')
+                parameter_details = json.loads(json_data)
+
+                for param in parameter_details:
+                    if not param.get('Value'):
+                        continue
+
+                    ssm_client = boto3.client('ssm', region_name=param['Region'])
+
+                    put_param_args = {
+                        'Name': param['Name'],
+                        'Value': param['Value'],
+                        'Type': param['Type'],
+                        'Overwrite': True,
+                        'Tier': param.get('Tier', 'Standard'),
+                        'Description': param.get('Description', '')
+                    }
+
+                    if param['Type'] == 'SecureString' and param.get('KeyId'):
+                        put_param_args['KeyId'] = param['KeyId']
+
+                    policies = param.get('Policies')
+                    if policies:
+                        policy_texts = [json.loads(p['PolicyText']) for p in policies if 'PolicyText' in p]
+                        if policy_texts:
+                            put_param_args['Policies'] = json.dumps(policy_texts)
+
+                    ssm_client.put_parameter(**put_param_args)
+
+                    tags = param.get('Tags')
+                    if tags:
+                        ssm_client.add_tags_to_resource(
+                            ResourceType='Parameter',
+                            ResourceId=param['Name'],
+                            Tags=tags
+                        )
+
+                return {"status": "Import successful"}
+      InputPayload:
+        S3BucketName: '{{ S3BucketName }}'
+        ParameterType: '{{ ParameterType }}'
+        S3FilePath: '{{ S3FilePath }}'
+        Regions: '{{ Regions }}'
+        Operation: '{{ Operation }}'
+    outputs:
+      - Name: OperationStatus
+        Selector: $.Payload.status
+        Type: String
